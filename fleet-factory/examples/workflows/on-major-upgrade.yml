@@ -1,0 +1,64 @@
+# SKETCH — not tested. Shows where the pieces sit for the event-driven flow:
+# "library X publishes a new major -> every repo in scope gets a PR that
+#  builds and passes checks -> a human reviews it".
+#
+# Lives in each service repo (or is pulled in from the shared pipeline
+# template, per CI-01). Renovate is the trigger: it already watches the
+# registry, opens one PR per repo, and puts the release notes in the PR body.
+#
+# Flow per repo:
+#   1. Renovate opens "Update X to v5" (version bump only).
+#   2. This workflow runs on that PR:
+#      a. OpenRewrite recipe for X, if one exists (deterministic part).
+#      b. Claude with the library-upgrade skill: reads the release notes,
+#         fixes what the recipe did not, runs mvn verify + conformance,
+#         retries up to a limit.
+#      c. Pushes to the same PR branch, labels it ready-for-review or
+#         needs-human, and writes what it did in a PR comment.
+#   3. A human reviews and merges. Nothing merges on its own.
+
+name: major-upgrade-assist
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  assist:
+    # Only Renovate major-update PRs, and only once (skip our own pushes).
+    if: >
+      github.actor == 'renovate[bot]' &&
+      contains(github.event.pull_request.labels.*.name, 'major')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21' }
+
+      # 2a. Deterministic migration. Recipe name comes from a mapping file
+      # in the template repo (library -> recipe). Skip if none.
+      - name: OpenRewrite recipe
+        run: |
+          RECIPE=$(./scripts/recipe-for.sh "${{ github.head_ref }}") || exit 0
+          mvn -B org.openrewrite.maven:rewrite-maven-plugin:run \
+            -Drewrite.activeRecipes="$RECIPE"
+
+      # 2b. Agent for the remainder. The PR body (with release notes) is the input.
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Use the library-upgrade skill.
+            PR: ${{ github.event.pull_request.html_url }}
+            Release notes are in the PR description.
+            Make mvn verify and check_conformance.py pass. Max 3 attempts.
+            Do not change business logic or weaken tests.
+            Push to this branch, then label the PR ready-for-review or needs-human.
