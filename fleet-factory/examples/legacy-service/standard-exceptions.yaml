@@ -1,0 +1,4 @@
+- rule: OBS-04
+  reason: SLO targets pending product sign-off
+  owner: ledger-team
+  expires: 2027-01-31
